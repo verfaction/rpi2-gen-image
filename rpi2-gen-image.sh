@@ -15,6 +15,35 @@
 # Copyright (C) 2015 Luca Falavigna <dktrkranz@debian.org>
 ########################################################################
 
+### FIXME:
+# - pull in deb-multimedia and install kodi
+# - open kodi firewall ports
+# - add pinning for custom repos
+# - add unattended-upgrades
+# - add partition auto-extend
+# - add debfoster keepers after initial install
+# - add swap partition
+# - sudoers with insults
+# - verbose booting (rcS)
+# - FB VGA screen resolution when booting
+# - bash-completion, xterm title, lesspipe
+# - sudoers insults
+# - ssh_config
+# - default MTA, mailrelay, root forward
+
+# XXX: not sure...
+# - ntp?
+# - journald log retention?
+# - tor/freedombox?
+# - puppet
+# - cpufreq
+# - DNSSEC enabled unbound?
+
+### XXX: NICE TO HAVE:
+# - cryptohome, cryptoswap
+# - yubikey unlocking
+# - pam_oath ssh login
+
 # Clean up all temporary mount points
 cleanup (){
   set +x
@@ -46,9 +75,17 @@ PASSWORD=${PASSWORD:=raspberry}
 DEFLOCAL=${DEFLOCAL:="en_US.UTF-8"}
 TIMEZONE=${TIMEZONE:="Europe/Berlin"}
 
+RSA_BITS=${RSA_BITS:=4096}
+
+SSH_PUBKEY=${SSH_PUBKEY:=""}
+
+PURE_DEBIAN=${PURE_DEBIAN:=true}
+
 # APT settings
 APT_PROXY=${APT_PROXY:=""}
-APT_SERVER=${APT_SERVER:="ftp.debian.org"}
+APT_SERVER=${APT_SERVER:="httpredir.debian.org"}
+
+NTP_SERVER=${NTP_SERVER:="pool.ntp.org"}
 
 # Feature settings
 ENABLE_CONSOLE=${ENABLE_CONSOLE:=true}
@@ -63,22 +100,28 @@ ENABLE_WM=${ENABLE_WM:=""}
 
 # Advanced settings
 ENABLE_MINBASE=${ENABLE_MINBASE:=false}
-ENABLE_UBOOT=${ENABLE_UBOOT:=false}
+ENABLE_UBOOT=${ENABLE_UBOOT:=true}
 ENABLE_FBTURBO=${ENABLE_FBTURBO:=false}
-ENABLE_HARDNET=${ENABLE_HARDNET:=false}
-ENABLE_IPTABLES=${ENABLE_IPTABLES:=false}
+ENABLE_HARDNET=${ENABLE_HARDNET:=true}
+ENABLE_IPTABLES=${ENABLE_IPTABLES:=true}
 
 # Image chroot path
 R=${BUILDDIR}/chroot
 
 # Packages required for bootstrapping
-REQUIRED_PACKAGES="debootstrap debian-archive-keyring qemu-user-static dosfstools rsync bmap-tools whois git-core"
+REQUIRED_PACKAGES="debootstrap debian-archive-keyring qemu-user-static dosfstools rsync bmap-tools whois git-core ntpdate"
 
 # Missing packages that need to be installed
 MISSING_PACKAGES=""
 
+# packages we're sure we don't need
+APT_EXCLUDES="nfacct,tasksel,nano,vim-tiny"
+
 # Packages required in the chroot build environment
-APT_INCLUDES="apt-transport-https,ca-certificates,debian-archive-keyring,dialog,sudo"
+APT_INCLUDES="ca-certificates,debian-archive-keyring,dialog,sudo,vim"
+if [ "${PURE_DEBIAN}" = false ];then
+  APT_INCLUDES="${APT_INCLUDES},apt-transport-https"
+fi
 
 set +x
 
@@ -109,6 +152,8 @@ fi
 
 # Make sure all required packages are installed
 apt-get -qq -y install ${REQUIRED_PACKAGES}
+
+ntpdate -u -b $NTP_SERVER
 
 # Don't clobber an old build
 if [ -e "$BUILDDIR" ]; then
@@ -177,14 +222,14 @@ fi
 
 # Set empty proxy string
 if [ -z "$APT_PROXY" ] ; then
-  APT_PROXY="http://"
+  APT_SERVER="http://${APT_SERVER}"
 fi
 
 # Base debootstrap (unpack only)
 if [ "$ENABLE_MINBASE" = true ] ; then
-  debootstrap --arch=armhf --variant=minbase --foreign --include=${APT_INCLUDES} $RELEASE $R ${APT_PROXY}${APT_SERVER}/debian
+  debootstrap --arch=armhf --variant=minbase --foreign --include=${APT_INCLUDES} --exclude=${APT_EXCLUDES} $RELEASE $R ${APT_PROXY}${APT_SERVER}/debian
 else
-  debootstrap --arch=armhf --foreign --include=${APT_INCLUDES} $RELEASE $R ${APT_PROXY}${APT_SERVER}/debian
+  debootstrap --arch=armhf --foreign --include=${APT_INCLUDES} --exclude=${APT_EXCLUDES} $RELEASE $R ${APT_PROXY}${APT_SERVER}/debian
 fi
 
 # Copy qemu emulator binary to chroot
@@ -203,16 +248,259 @@ mount -t sysfs none $R/sys
 mount --bind /dev/pts $R/dev/pts
 
 # Use proxy inside chroot
-if [ -z "$APT_PROXY" ] ; then
+if [ -n "$APT_PROXY" ] ; then
   echo "Acquire::http::Proxy \"$APT_PROXY\"" >> $R/etc/apt/apt.conf.d/10proxy
 fi
 
-# Pin package flash-kernel to repositories.collabora.co.uk
-cat <<EOM >$R/etc/apt/preferences.d/flash-kernel
+# default /dev/random as urandom
+cat <<EOM >$R/etc/udev/rules.d/70-disable-random-entropy-estimation.rules
+# /etc/udev/rules.d/70-disable-random-entropy-estimation.rules
+# Disables /dev/random entropy estimation (it's mostly snake oil anyway).
+#
+# udevd will warn that the kernel-provided name 'random' and NAME= 'eerandom'
+# disagree.  You can ignore this warning.
+#
+### Use /dev/eerandom instead of /dev/random for the entropy-estimating RNG.
+##KERNEL=="random", NAME="eerandom"
+#
+### Remove any existing /dev/random, then create symlink /dev/random pointing to
+### /dev/urandom
+KERNEL=="urandom", PROGRAM+="/bin/rm -f /dev/random", SYMLINK+="random"
+EOM
+
+# add apt.conf defaults
+cat <<EOM >$R/etc/apt/apt.conf.d/99-defaults
+APT::Get::AutomaticRemove "0";
+APT::Get::HideAutoRemove "1";
+APT::Install-Recommends "0";
+APT::Install-Suggests "0";
+Debug::pkgAutoRemove "0";
+
+Acquire::PDiffs "false";
+// Trigger deferred
+DPkg::NoTriggers "true";
+PackageManager::Configure "smart";
+DPkg::ConfigurePending "true";
+DPkg::TriggersPending "true";
+
+Acquire {
+  CompressionTypes
+  {
+    bz2 "bzip2";
+    lzma "lzma";
+    gz "gzip";
+
+    Order { "gz"; "lzma"; "bz2"; };
+  };
+};
+// we don't care for Translations and want to speed up apt
+Acquire::Languages "none";
+EOM
+
+# regenerate ssh host keys
+if [ "$ENABLE_SSHD" = true ] ; then
+cat <<EOM >${R}/etc/ssh/sshd_config
+# Package generated configuration file
+# See the sshd_config(5) manpage for details
+
+# What ports, IPs and protocols we listen for
+Port 22
+# Use these options to restrict which interfaces/protocols sshd will bind to
+#ListenAddress ::
+#ListenAddress 0.0.0.0
+RSAAuthentication no
+Protocol 2
+# HostKeys for protocol version 2
+HostKey /etc/ssh/ssh_host_rsa_key
+HostKey /etc/ssh/ssh_host_ed25519_key
+#Privilege Separation is turned on for security
+UsePrivilegeSeparation sandbox
+
+# recommendations as per https://stribika.github.io/2015/01/04/secure-secure-shell.html
+KexAlgorithms curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256,diffie-hellman-group14-sha1
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-ripemd160-etm@openssh.com,umac-128-etm@openssh.com,hmac-sha2-512,hmac-sha2-256,hmac-ripemd160,hmac-sha1
+
+# Lifetime and size of ephemeral version 1 server key
+KeyRegenerationInterval 3600
+ServerKeyBits 4096
+
+# Logging
+SyslogFacility AUTH
+LogLevel INFO
+
+# Authentication:
+LoginGraceTime 120
+PermitRootLogin without-password
+StrictModes yes
+
+
+PubkeyAuthentication yes
+#AuthorizedKeysFile     %h/.ssh/authorized_keys
+
+# Don't read the user's ~/.rhosts and ~/.shosts files
+IgnoreRhosts yes
+# For this to work you will also need host keys in /etc/ssh_known_hosts
+RhostsRSAAuthentication no
+# similar for protocol version 2
+HostbasedAuthentication no
+# Uncomment if you don't trust ~/.ssh/known_hosts for RhostsRSAAuthentication
+#IgnoreUserKnownHosts yes
+
+# To enable empty passwords, change to yes (NOT RECOMMENDED)
+PermitEmptyPasswords no
+
+# Change to yes to enable challenge-response passwords (beware issues with
+# some PAM modules and threads)
+ChallengeResponseAuthentication no
+
+# Change to no to disable tunnelled clear text passwords
+EOM
+  if [ -z "$SSH_PUBKEY" ];then
+    echo "PasswordAuthentication yes"  >>${R}/etc/ssh/sshd_config
+  else
+    echo "PasswordAuthentication no"  >>${R}/etc/ssh/sshd_config
+  fi
+  cat <<EOM >>${R}/etc/ssh/sshd_config
+
+# Kerberos options
+#KerberosAuthentication no
+#KerberosGetAFSToken no
+#KerberosOrLocalPasswd yes
+#KerberosTicketCleanup yes
+
+# GSSAPI options
+#GSSAPIAuthentication no
+#GSSAPICleanupCredentials yes
+
+X11Forwarding no
+X11DisplayOffset 10
+PrintMotd no
+PrintLastLog yes
+TCPKeepAlive yes
+ClientAliveInterval 120
+#UseLogin no
+UseDNS yes
+
+#MaxStartups 10:30:60
+MaxStartups 20
+
+# Allow client to pass locale environment variables
+AcceptEnv LANG LC_*
+
+Subsystem sftp /usr/lib/openssh/sftp-server
+
+# Set this to 'yes' to enable PAM authentication, account processing,
+# and session processing. If this is enabled, PAM authentication will
+# be allowed through the ChallengeResponseAuthentication and
+# PasswordAuthentication.  Depending on your PAM configuration,
+# PAM authentication via ChallengeResponseAuthentication may bypass
+# the setting of "PermitRootLogin without-password".
+# If you just want the PAM account and session checks to run without
+# PAM authentication, then enable this but set PasswordAuthentication
+# and ChallengeResponseAuthentication to 'no'.
+EOM
+  if [ -z "$SSH_PUBKEY" ];then
+    echo "UsePAM yes"  >>${R}/etc/ssh/sshd_config
+  else
+    echo "UsePAM no"  >>${R}/etc/ssh/sshd_config
+  fi
+cat <<'EOM' >${R}/etc/ssh/ssh_config
+Host *
+    SendEnv LANG LC_*
+    HashKnownHosts yes
+    #CanonicalizeHostname yes
+    #CanonicalDomains $DEFAULTDOMAIN
+    # recommendations as per https://stribika.github.io/2015/01/04/secure-secure-shell.html
+    KexAlgorithms curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256,diffie-hellman-group14-sha1
+    Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+    MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-ripemd160-etm@openssh.com,umac-128-etm@openssh.com,hmac-sha2-512,hmac-sha2-256,hmac-ripemd160,hmac-sha1
+
+    # fix CVE-2016-0777
+    UseRoaming no
+EOM
+fi
+
+if [ "$PURE_DEBIAN" = true ] ; then
+  # Set up initial sources.list
+  cat <<EOM >$R/etc/apt/sources.list
+deb ${APT_SERVER}/debian ${RELEASE} main contrib
+#deb-src ${APT_SERVER}/debian ${RELEASE} main contrib
+
+deb ${APT_SERVER}/debian/ ${RELEASE}-updates main contrib
+#deb-src ${APT_SERVER}/debian/ ${RELEASE}-updates main contrib
+
+deb http://security.debian.org/ ${RELEASE}/updates main contrib
+#deb-src http://security.debian.org/ ${RELEASE}/updates main contrib
+
+# just to pull linux-image-4.4
+deb ${APT_SERVER}/debian testing main contrib
+deb http://security.debian.org/ testing/updates main contrib
+
+deb ${APT_SERVER}/debian unstable main contrib
+deb ${APT_SERVER}/debian experimental main contrib
+EOM
+cat <<EOM >$R/etc/apt/apt.conf.d/01-default-relase
+APT::Default-Release "${RELEASE}";
+EOM
+
+  # Pin package flash-kernel to repositories.collabora.co.uk
+  cat <<EOM >$R/etc/apt/preferences.d/linux-image-4.4.pref
+Package: linux-image-4.4* u-boot-rpi
+Pin: release a=stable
+Pin-Priority: 990
+
+Package: linux-image-4.4* u-boot-rpi
+Pin: release a=testing
+Pin-Priority: 980
+
+Package: linux-image-4.4* u-boot-rpi
+Pin: release a=unstable
+Pin-Priority: 970
+
+Package: linux-image-4.4* u-boot-rpi
+Pin: release a=experimental
+Pin-Priority: 960
+EOM
+LANG=C chroot $R apt-get -qq -y update
+LANG=C chroot $R apt-get -qq -y install linux-image-4.4.0-trunk-armmp-lpae
+else
+  # Set up initial sources.list
+  cat <<EOM >$R/etc/apt/sources.list
+deb ${APT_SERVER}/debian ${RELEASE} main contrib
+#deb-src ${APT_SERVER}/debian ${RELEASE} main contrib
+
+deb ${APT_SERVER}/debian/ ${RELEASE}-updates main contrib
+#deb-src ${APT_SERVER}/debian/ ${RELEASE}-updates main contrib
+
+deb http://security.debian.org/ ${RELEASE}/updates main contrib
+#deb-src http://security.debian.org/ ${RELEASE}/updates main contrib
+EOM
+
+  # Pin package flash-kernel to repositories.collabora.co.uk
+  cat <<EOM >$R/etc/apt/preferences.d/flash-kernel.pref
 Package: flash-kernel
 Pin: origin repositories.collabora.co.uk
 Pin-Priority: 1000
 EOM
+  # Upgrade collabora package index and install collabora keyring
+  echo "deb https://repositories.collabora.co.uk/debian ${RELEASE} rpi2" >$R/etc/apt/sources.list.d/collabora-rpi2
+  LANG=C chroot $R apt-get -qq -y update
+  LANG=C chroot $R apt-get -qq -y --force-yes install collabora-obs-archive-keyring
+  
+  # Kernel installation
+  # Install flash-kernel last so it doesn't try (and fail) to detect the platform in the chroot
+  LANG=C chroot $R apt-get -qq -y --no-install-recommends install linux-image-3.18.0-trunk-rpi2
+  LANG=C chroot $R apt-get -qq -y install flash-kernel
+  # required boot binaries from raspberry/firmware github (commit: "kernel: Bump to 3.18.10")
+  wget -q -O $R/boot/firmware/bootcode.bin https://github.com/raspberrypi/firmware/raw/cd355a9dd4f1f4de2e79b0c8e102840885cdf1de/boot/bootcode.bin
+  wget -q -O $R/boot/firmware/fixup_cd.dat https://github.com/raspberrypi/firmware/raw/cd355a9dd4f1f4de2e79b0c8e102840885cdf1de/boot/fixup_cd.dat
+  wget -q -O $R/boot/firmware/fixup.dat https://github.com/raspberrypi/firmware/raw/cd355a9dd4f1f4de2e79b0c8e102840885cdf1de/boot/fixup.dat
+  wget -q -O $R/boot/firmware/fixup_x.dat https://github.com/raspberrypi/firmware/raw/cd355a9dd4f1f4de2e79b0c8e102840885cdf1de/boot/fixup_x.dat
+  wget -q -O $R/boot/firmware/start_cd.elf https://github.com/raspberrypi/firmware/raw/cd355a9dd4f1f4de2e79b0c8e102840885cdf1de/boot/start_cd.elf
+  wget -q -O $R/boot/firmware/start.elf https://github.com/raspberrypi/firmware/raw/cd355a9dd4f1f4de2e79b0c8e102840885cdf1de/boot/start.elf
+  wget -q -O $R/boot/firmware/start_x.elf https://github.com/raspberrypi/firmware/raw/cd355a9dd4f1f4de2e79b0c8e102840885cdf1de/boot/start_x.elf
+fi
 
 # Set up timezone
 echo ${TIMEZONE} >$R/etc/timezone
@@ -224,46 +512,19 @@ if [ "$ENABLE_MINBASE" = false ] ; then
   LANG=C chroot $R locale-gen ${DEFLOCAL}
 fi
 
-# Upgrade collabora package index and install collabora keyring
-echo "deb https://repositories.collabora.co.uk/debian ${RELEASE} rpi2" >$R/etc/apt/sources.list
-LANG=C chroot $R apt-get -qq -y update
-LANG=C chroot $R apt-get -qq -y --force-yes install collabora-obs-archive-keyring
+# throw away stuff we don't need
+LANG=C chroot $R apt-get -y -q purge --auto-remove tasksel tasksel-data nano vim-tiny
 
-# Set up initial sources.list
-cat <<EOM >$R/etc/apt/sources.list
-deb http://${APT_SERVER}/debian ${RELEASE} main contrib
-#deb-src http://${APT_SERVER}/debian ${RELEASE} main contrib
-
-deb http://${APT_SERVER}/debian/ ${RELEASE}-updates main contrib
-#deb-src http://${APT_SERVER}/debian/ ${RELEASE}-updates main contrib
-
-deb http://security.debian.org/ ${RELEASE}/updates main contrib
-#deb-src http://security.debian.org/ ${RELEASE}/updates main contrib
-
-deb https://repositories.collabora.co.uk/debian ${RELEASE} rpi2
-EOM
+# install stuff we definitely want...
+LANG=C chroot $R apt-get -q -y install --no-install-recommends lsb-release debian-goodies lsof logrotate dnsutils iproute2
 
 # Upgrade package index and update all installed packages and changed dependencies
-LANG=C chroot $R apt-get -qq -y update
 LANG=C chroot $R apt-get -qq -y -u dist-upgrade
-
-# Kernel installation
-# Install flash-kernel last so it doesn't try (and fail) to detect the platform in the chroot
-LANG=C chroot $R apt-get -qq -y --no-install-recommends install linux-image-3.18.0-trunk-rpi2
-LANG=C chroot $R apt-get -qq -y install flash-kernel
 
 VMLINUZ="$(ls -1 $R/boot/vmlinuz-* | sort | tail -n 1)"
 [ -z "$VMLINUZ" ] && exit 1
 mkdir -p $R/boot/firmware
 
-# required boot binaries from raspberry/firmware github (commit: "kernel: Bump to 3.18.10")
-wget -q -O $R/boot/firmware/bootcode.bin https://github.com/raspberrypi/firmware/raw/cd355a9dd4f1f4de2e79b0c8e102840885cdf1de/boot/bootcode.bin
-wget -q -O $R/boot/firmware/fixup_cd.dat https://github.com/raspberrypi/firmware/raw/cd355a9dd4f1f4de2e79b0c8e102840885cdf1de/boot/fixup_cd.dat
-wget -q -O $R/boot/firmware/fixup.dat https://github.com/raspberrypi/firmware/raw/cd355a9dd4f1f4de2e79b0c8e102840885cdf1de/boot/fixup.dat
-wget -q -O $R/boot/firmware/fixup_x.dat https://github.com/raspberrypi/firmware/raw/cd355a9dd4f1f4de2e79b0c8e102840885cdf1de/boot/fixup_x.dat
-wget -q -O $R/boot/firmware/start_cd.elf https://github.com/raspberrypi/firmware/raw/cd355a9dd4f1f4de2e79b0c8e102840885cdf1de/boot/start_cd.elf
-wget -q -O $R/boot/firmware/start.elf https://github.com/raspberrypi/firmware/raw/cd355a9dd4f1f4de2e79b0c8e102840885cdf1de/boot/start.elf
-wget -q -O $R/boot/firmware/start_x.elf https://github.com/raspberrypi/firmware/raw/cd355a9dd4f1f4de2e79b0c8e102840885cdf1de/boot/start_x.elf
 cp $VMLINUZ $R/boot/firmware/kernel7.img
 
 # Set up IPv4 hosts
@@ -307,7 +568,7 @@ fi
 LANG=C chroot $R systemctl enable systemd-networkd
 
 # Generate crypt(3) password string
-ENCRYPTED_PASSWORD=`mkpasswd -m sha-512 ${PASSWORD}`
+ENCRYPTED_PASSWORD=`mkpasswd -m sha-512 "${PASSWORD}"`
 
 # Set up default user
 LANG=C chroot $R adduser --gecos "Raspberry PI user" --add_extra_groups --disabled-password pi
@@ -317,7 +578,7 @@ LANG=C chroot $R usermod -a -G sudo -p "${ENCRYPTED_PASSWORD}" pi
 LANG=C chroot $R usermod -p "${ENCRYPTED_PASSWORD}" root
 
 # Set up firmware boot cmdline
-CMDLINE="dwc_otg.lpm_enable=0 root=/dev/mmcblk0p2 rootfstype=ext4 rootflags=commit=100,data=writeback elevator=deadline rootwait net.ifnames=1 console=tty1"
+CMDLINE="dwc_otg.lpm_enable=0 root=/dev/mmcblk0p2 rootfstype=ext4 rootflags=commit=100,data=writeback,noatime,nodiratime elevator=deadline rootwait net.ifnames=1 console=tty1"
 
 # Set up serial console support (if requested)
 if [ "$ENABLE_CONSOLE" = true ] ; then
@@ -506,10 +767,16 @@ spoof warn
 EOM
 fi
 
+cat <<EOM >$R/etc/systemd/timesyncd.conf
+[Time]
+Servers=$NTP_SERVER
+EOM
+
 # Regenerate openssh server host keys
 if [ "$ENABLE_SSHD" = true ] ; then
-  rm -fr $R/etc/ssh/ssh_host_*
-  LANG=C chroot $R dpkg-reconfigure openssh-server
+  # leave the ed25519 key in place...
+  rm -f $R/etc/ssh/ssh_host_rsa_key* $R/etc/ssh/ssh_host_dsa_key* $R/etc/ssh/ssh_host_ecdsa_key*
+  LANG=C chroot $R ssh-keygen -f /etc/ssh/ssh_host_rsa_key -t rsa -b ${RSA_BITS} -N '' -h
 fi
 
 # Enable serial console systemd style
@@ -601,7 +868,7 @@ COMMIT
 EOM
 
   # Reload systemd configuration and enable iptables service
-  LANG=C chroot $R systemctl daemon-reload
+  #LANG=C chroot $R systemctl daemon-reload
   LANG=C chroot $R systemctl enable iptables.service
 
   if [ "$ENABLE_IPV6" = true ] ; then
@@ -623,16 +890,16 @@ WantedBy=multi-user.target
 EOM
 
     # Create ip6tables file
-    cat <<EOM >$R/etc/iptables/flush-ip6tables.sh
+    cat >$R/etc/iptables/flush-ip6tables.sh <<'EOM'
 #!/bin/sh
 ip6tables -F
 ip6tables -X
 ip6tables -Z
 for table in $(</proc/net/ip6_tables_names)
 do
-        ip6tables -t \$table -F
-        ip6tables -t \$table -X
-        ip6tables -t \$table -Z
+        ip6tables -t $table -F
+        ip6tables -t $table -X
+        ip6tables -t $table -Z
 done
 ip6tables -P INPUT ACCEPT
 ip6tables -P OUTPUT ACCEPT
@@ -692,7 +959,7 @@ COMMIT
 EOM
 
   # Reload systemd configuration and enable iptables service
-  LANG=C chroot $R systemctl daemon-reload
+  #LANG=C chroot $R systemctl daemon-reload
   LANG=C chroot $R systemctl enable ip6tables.service
   fi
 fi
@@ -701,23 +968,38 @@ fi
 if [ "$ENABLE_SSHD" = false ] ; then
  sed -e '/^#/! {/SSH/ s/^/# /}' -i $R/etc/iptables/iptables.rules 2> /dev/null
  sed -e '/^#/! {/SSH/ s/^/# /}' -i $R/etc/iptables/ip6tables.rules 2> /dev/null
+elif [ -n "$SSH_PUBKEY" ];then
+  LANG=C chroot $R install -d -m 0700 -o root -g root /root/.ssh/
+  LANG=C chroot $R install -d -m 0700 -o root -g root /home/pi/.ssh/
+  echo "$SSH_PUBKEY" >$R/root/.ssh/authorized_keys
+  echo "$SSH_PUBKEY" >$R/home/pi/.ssh/authorized_keys
+  chmod 0600 $R/root/.ssh/authorized_keys $R/home/pi/.ssh/authorized_keys
 fi
 
 # Install gcc/c++ build environment inside the chroot
-if [ "$ENABLE_UBOOT" = true ] || [ "$ENABLE_FBTURBO" = true ]; then
+if [ "$ENABLE_FBTURBO" = true ]; then
+  LANG=C chroot $R apt-get install -q -y --force-yes --no-install-recommends linux-compiler-gcc-4.9-arm g++ make bc
+fi
+if [ "$ENABLE_UBOOT" = true -a "$PURE_DEBIAN" != true ]; then
   LANG=C chroot $R apt-get install -q -y --force-yes --no-install-recommends linux-compiler-gcc-4.9-arm g++ make bc
 fi
 
 # Fetch and build U-Boot bootloader
 if [ "$ENABLE_UBOOT" = true ] ; then
-  # Fetch U-Boot bootloader sources
-  git -C $R/tmp clone git://git.denx.de/u-boot.git
-
-  # Build and install U-Boot inside chroot
-  LANG=C chroot $R make -C /tmp/u-boot/ rpi_2_defconfig all
-
-  # Copy compiled bootloader binary and set config.txt to load it
-  cp $R/tmp/u-boot/u-boot.bin $R/boot/firmware/
+  if [ "$PURE_DEBIAN" = true ];then
+    LANG=C chroot $R apt-get -qq -y install u-boot-rpi u-boot-tools
+    # Copy bootloader binary and set config.txt to load it
+    cp $R/usr/lib/u-boot/rpi_2/u-boot.bin $R/boot/firmware/
+  else
+    # Fetch U-Boot bootloader sources
+    git -C $R/tmp clone git://git.denx.de/u-boot.git
+  
+    # Build and install U-Boot inside chroot
+    LANG=C chroot $R make -C /tmp/u-boot/ rpi_2_defconfig all
+  
+    # Copy compiled bootloader binary and set config.txt to load it
+    cp $R/tmp/u-boot/u-boot.bin $R/boot/firmware/
+  fi
   printf "\n# boot u-boot kernel\nkernel=u-boot.bin\n" >> $R/boot/firmware/config.txt
 
   # Set U-Boot command file
@@ -768,14 +1050,14 @@ EOM
 fi
 
 # Remove gcc/c++ build environment from the chroot
-if [ "$ENABLE_UBOOT" = true ] || [ "$ENABLE_FBTURBO" = true ]; then
+if [ "$ENABLE_UBOOT" = true -a "$PURE_DEBIAN" != true ] || [ "$ENABLE_FBTURBO" = true ]; then
   LANG=C chroot $R apt-get -y -q purge --auto-remove bc binutils cpp cpp-4.9 g++ g++-4.9 gcc gcc-4.9 libasan1 libatomic1 libc-dev-bin libc6-dev libcloog-isl4 libgcc-4.9-dev libgomp1 libisl10 libmpc3 libmpfr4 libstdc++-4.9-dev libubsan0 linux-compiler-gcc-4.9-arm linux-libc-dev make
 fi
 
 # Clean cached downloads
 LANG=C chroot $R apt-get -y clean
 LANG=C chroot $R apt-get -y autoclean
-LANG=C chroot $R apt-get -y autoremove
+LANG=C chroot $R apt-get -y autoremove --purge
 
 # Unmount mounted filesystems
 umount -l $R/proc
@@ -806,9 +1088,11 @@ IMAGE_SECTORS=`expr $(expr ${IMAGE_SIZE} \* 1048576) / 512 - 133120`
 # Prepare date string for image file name
 DATE="$(date +%Y-%m-%d)"
 
-# Prepare image file
-dd if=/dev/zero of="$BASEDIR/${DATE}-debian-${RELEASE}.img" bs=1M count=1
-dd if=/dev/zero of="$BASEDIR/${DATE}-debian-${RELEASE}.img" bs=1M count=0 seek=${IMAGE_SIZE}
+# Prepare image file - try with sparse files first...
+if ! truncate -s ${IMAGE_SIZE}M "$BASEDIR/${DATE}-debian-${RELEASE}.img";then
+  dd if=/dev/zero of="$BASEDIR/${DATE}-debian-${RELEASE}.img" bs=1M count=1
+  dd if=/dev/zero of="$BASEDIR/${DATE}-debian-${RELEASE}.img" bs=1M count=0 seek=${IMAGE_SIZE}
+fi
 
 # Write partition table
 sfdisk -q -L -f "$BASEDIR/${DATE}-debian-${RELEASE}.img" <<EOM
